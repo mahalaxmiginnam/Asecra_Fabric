@@ -32,8 +32,6 @@ func (e *Executor) Execute(
 	req *http.Request,
 ) (*Result, error) {
 
-	// 1. Circuit breaker decides whether this client request
-	// is allowed to enter the retry/upstream layer.
 	if e.Breaker != nil {
 		if err := e.Breaker.Allow(); err != nil {
 			return nil, err
@@ -46,6 +44,24 @@ func (e *Executor) Execute(
 	)
 	defer cancel()
 
+	// Read the incoming request body once.
+	var requestBody []byte
+
+	if req.Body != nil {
+		var err error
+
+		requestBody, err = io.ReadAll(req.Body)
+		if err != nil {
+			if e.Breaker != nil {
+				e.Breaker.Failure()
+			}
+
+			return nil, err
+		}
+
+		_ = req.Body.Close()
+	}
+
 	var lastErr error
 
 	for attempt := 1; attempt <= e.Retry.MaxAttempts; attempt++ {
@@ -53,75 +69,69 @@ func (e *Executor) Execute(
 		result, err := e.executeOnce(
 			ctx,
 			req,
+			requestBody,
 		)
 
-		// Network / transport failure.
 		if err != nil {
 			lastErr = err
 
-			// Retry if budget remains.
-			if e.Retry.ShouldAttempt(attempt + 1) {
-
-				if waitErr := e.Retry.Wait(
-					ctx,
-					attempt,
-				); waitErr != nil {
-					// The request itself failed because the
-					// context expired/cancelled. Treat this
-					// client execution as one failure.
-					if e.Breaker != nil {
-						e.Breaker.Failure()
-					}
-
-					return nil, waitErr
+			if !e.shouldRetry(req, attempt) {
+				if e.Breaker != nil {
+					e.Breaker.Failure()
 				}
 
-				continue
+				return nil, err
 			}
 
-			// Exhausted retry budget.
-			if e.Breaker != nil {
-				e.Breaker.Failure()
+			if waitErr := e.Retry.Wait(
+				ctx,
+				attempt,
+			); waitErr != nil {
+
+				if e.Breaker != nil {
+					e.Breaker.Failure()
+				}
+
+				return nil, waitErr
 			}
 
-			return nil, lastErr
+			continue
 		}
 
-		// Dependency-level failure.
 		if circuitbreaker.ShouldCountAsFailure(
 			result.StatusCode,
 		) {
 
-			// Retry while budget remains.
-			if e.Retry.ShouldAttempt(attempt + 1) {
+			if !e.shouldRetryResponse(
+				req,
+				result,
+				attempt,
+			) {
 
-				if waitErr := e.Retry.Wait(
-					ctx,
-					attempt,
-				); waitErr != nil {
-
-					if e.Breaker != nil {
-						e.Breaker.Failure()
-					}
-
-					return nil, waitErr
+				if e.Breaker != nil {
+					e.Breaker.Failure()
 				}
 
-				continue
+				result.Attempts = attempt
+
+				return result, nil
 			}
 
-			// Final dependency failure.
-			if e.Breaker != nil {
-				e.Breaker.Failure()
+			if waitErr := e.Retry.Wait(
+				ctx,
+				attempt,
+			); waitErr != nil {
+
+				if e.Breaker != nil {
+					e.Breaker.Failure()
+				}
+
+				return nil, waitErr
 			}
 
-			result.Attempts = attempt
-
-			return result, nil
+			continue
 		}
 
-		// Any non-dependency-failure response is considered
-		// successful from the circuit breaker's perspective.
 		if e.Breaker != nil {
 			e.Breaker.Success()
 		}
@@ -131,7 +141,6 @@ func (e *Executor) Execute(
 		return result, nil
 	}
 
-	// Defensive fallback.
 	if e.Breaker != nil {
 		e.Breaker.Failure()
 	}
@@ -143,9 +152,53 @@ func (e *Executor) Execute(
 	return nil, context.DeadlineExceeded
 }
 
+func (e *Executor) shouldRetry(
+	req *http.Request,
+	attempt int,
+) bool {
+
+	if !e.Retry.ShouldAttempt(attempt + 1) {
+		return false
+	}
+
+	decision := retry.IsRetryable(
+		retry.RequestPolicy{
+			Method: req.Method,
+		},
+		retry.ResponsePolicy{
+			StatusCode: http.StatusServiceUnavailable,
+		},
+	)
+
+	return decision == retry.Retry
+}
+
+func (e *Executor) shouldRetryResponse(
+	req *http.Request,
+	result *Result,
+	attempt int,
+) bool {
+
+	if !e.Retry.ShouldAttempt(attempt + 1) {
+		return false
+	}
+
+	decision := retry.IsRetryable(
+		retry.RequestPolicy{
+			Method: req.Method,
+		},
+		retry.ResponsePolicy{
+			StatusCode: result.StatusCode,
+		},
+	)
+
+	return decision == retry.Retry
+}
+
 func (e *Executor) executeOnce(
 	ctx context.Context,
 	req *http.Request,
+	body []byte,
 ) (*Result, error) {
 
 	upstreamURL := *e.Upstream
@@ -161,7 +214,7 @@ func (e *Executor) executeOnce(
 		ctx,
 		req.Method,
 		upstreamURL.String(),
-		bytes.NewReader(nil),
+		bytes.NewReader(body),
 	)
 
 	if err != nil {
@@ -177,7 +230,7 @@ func (e *Executor) executeOnce(
 
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -185,7 +238,7 @@ func (e *Executor) executeOnce(
 	return &Result{
 		StatusCode: resp.StatusCode,
 		Header:     resp.Header.Clone(),
-		Body:       body,
+		Body:       responseBody,
 	}, nil
 }
 
@@ -198,6 +251,10 @@ func (r *Result) WriteTo(
 			w.Header().Add(key, value)
 		}
 	}
+
+	// Avoid forwarding an upstream Content-Length that may no longer
+	// match the response after gateway processing.
+	w.Header().Del("Content-Length")
 
 	w.WriteHeader(r.StatusCode)
 

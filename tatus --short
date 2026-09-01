@@ -1,0 +1,251 @@
+[1mdiff --git a/internal/proxy/executor.go b/internal/proxy/executor.go[m
+[1mindex 8a470a1..dfc11e2 100644[m
+[1m--- a/internal/proxy/executor.go[m
+[1m+++ b/internal/proxy/executor.go[m
+[36m@@ -32,8 +32,6 @@[m [mfunc (e *Executor) Execute([m
+ 	req *http.Request,[m
+ ) (*Result, error) {[m
+ [m
+[31m-	// 1. Circuit breaker decides whether this client request[m
+[31m-	// is allowed to enter the retry/upstream layer.[m
+ 	if e.Breaker != nil {[m
+ 		if err := e.Breaker.Allow(); err != nil {[m
+ 			return nil, err[m
+[36m@@ -46,6 +44,24 @@[m [mfunc (e *Executor) Execute([m
+ 	)[m
+ 	defer cancel()[m
+ [m
+[32m+[m	[32m// Read the incoming request body once.[m
+[32m+[m	[32mvar requestBody []byte[m
+[32m+[m
+[32m+[m	[32mif req.Body != nil {[m
+[32m+[m		[32mvar err error[m
+[32m+[m
+[32m+[m		[32mrequestBody, err = io.ReadAll(req.Body)[m
+[32m+[m		[32mif err != nil {[m
+[32m+[m			[32mif e.Breaker != nil {[m
+[32m+[m				[32me.Breaker.Failure()[m
+[32m+[m			[32m}[m
+[32m+[m
+[32m+[m			[32mreturn nil, err[m
+[32m+[m		[32m}[m
+[32m+[m
+[32m+[m		[32m_ = req.Body.Close()[m
+[32m+[m	[32m}[m
+[32m+[m
+ 	var lastErr error[m
+ [m
+ 	for attempt := 1; attempt <= e.Retry.MaxAttempts; attempt++ {[m
+[36m@@ -53,75 +69,69 @@[m [mfunc (e *Executor) Execute([m
+ 		result, err := e.executeOnce([m
+ 			ctx,[m
+ 			req,[m
+[32m+[m			[32mrequestBody,[m
+ 		)[m
+ [m
+[31m-		// Network / transport failure.[m
+ 		if err != nil {[m
+ 			lastErr = err[m
+ [m
+[31m-			// Retry if budget remains.[m
+[31m-			if e.Retry.ShouldAttempt(attempt + 1) {[m
+[31m-[m
+[31m-				if waitErr := e.Retry.Wait([m
+[31m-					ctx,[m
+[31m-					attempt,[m
+[31m-				); waitErr != nil {[m
+[31m-					// The request itself failed because the[m
+[31m-					// context expired/cancelled. Treat this[m
+[31m-					// client execution as one failure.[m
+[31m-					if e.Breaker != nil {[m
+[31m-						e.Breaker.Failure()[m
+[31m-					}[m
+[31m-[m
+[31m-					return nil, waitErr[m
+[32m+[m			[32mif !e.shouldRetry(req, attempt) {[m
+[32m+[m				[32mif e.Breaker != nil {[m
+[32m+[m					[32me.Breaker.Failure()[m
+ 				}[m
+ [m
+[31m-				continue[m
+[32m+[m				[32mreturn nil, err[m
+ 			}[m
+ [m
+[31m-			// Exhausted retry budget.[m
+[31m-			if e.Breaker != nil {[m
+[31m-				e.Breaker.Failure()[m
+[32m+[m			[32mif waitErr := e.Retry.Wait([m
+[32m+[m				[32mctx,[m
+[32m+[m				[32mattempt,[m
+[32m+[m			[32m); waitErr != nil {[m
+[32m+[m
+[32m+[m				[32mif e.Breaker != nil {[m
+[32m+[m					[32me.Breaker.Failure()[m
+[32m+[m				[32m}[m
+[32m+[m
+[32m+[m				[32mreturn nil, waitErr[m
+ 			}[m
+ [m
+[31m-			return nil, lastErr[m
+[32m+[m			[32mcontinue[m
+ 		}[m
+ [m
+[31m-		// Dependency-level failure.[m
+ 		if circuitbreaker.ShouldCountAsFailure([m
+ 			result.StatusCode,[m
+ 		) {[m
+ [m
+[31m-			// Retry while budget remains.[m
+[31m-			if e.Retry.ShouldAttempt(attempt + 1) {[m
+[32m+[m			[32mif !e.shouldRetryResponse([m
+[32m+[m				[32mreq,[m
+[32m+[m				[32mresult,[m
+[32m+[m				[32mattempt,[m
+[32m+[m			[32m) {[m
+ [m
+[31m-				if waitErr := e.Retry.Wait([m
+[31m-					ctx,[m
+[31m-					attempt,[m
+[31m-				); waitErr != nil {[m
+[31m-[m
+[31m-					if e.Breaker != nil {[m
+[31m-						e.Breaker.Failure()[m
+[31m-					}[m
+[31m-[m
+[31m-					return nil, waitErr[m
+[32m+[m				[32mif e.Breaker != nil {[m
+[32m+[m					[32me.Breaker.Failure()[m
+ 				}[m
+ [m
+[31m-				continue[m
+[31m-			}[m
+[32m+[m				[32mresult.Attempts = attempt[m
+ [m
+[31m-			// Final dependency failure.[m
+[31m-			if e.Breaker != nil {[m
+[31m-				e.Breaker.Failure()[m
+[32m+[m				[32mreturn result, nil[m
+ 			}[m
+ [m
+[31m-			result.Attempts = attempt[m
+[32m+[m			[32mif waitErr := e.Retry.Wait([m
+[32m+[m				[32mctx,[m
+[32m+[m				[32mattempt,[m
+[32m+[m			[32m); waitErr != nil {[m
+ [m
+[31m-			return result, nil[m
+[32m+[m				[32mif e.Breaker != nil {[m
+[32m+[m					[32me.Breaker.Failure()[m
+[32m+[m				[32m}[m
+[32m+[m
+[32m+[m				[32mreturn nil, waitErr[m
+[32m+[m			[32m}[m
+[32m+[m
+[32m+[m			[32mcontinue[m
+ 		}[m
+ [m
+[31m-		// Any non-dependency-failure response is considered[m
+[31m-		// successful from the circuit breaker's perspective.[m
+ 		if e.Breaker != nil {[m
+ 			e.Breaker.Success()[m
+ 		}[m
+[36m@@ -131,7 +141,6 @@[m [mfunc (e *Executor) Execute([m
+ 		return result, nil[m
+ 	}[m
+ [m
+[31m-	// Defensive fallback.[m
+ 	if e.Breaker != nil {[m
+ 		e.Breaker.Failure()[m
+ 	}[m
+[36m@@ -143,9 +152,53 @@[m [mfunc (e *Executor) Execute([m
+ 	return nil, context.DeadlineExceeded[m
+ }[m
+ [m
+[32m+[m[32mfunc (e *Executor) shouldRetry([m
+[32m+[m	[32mreq *http.Request,[m
+[32m+[m	[32mattempt int,[m
+[32m+[m[32m) bool {[m
+[32m+[m
+[32m+[m	[32mif !e.Retry.ShouldAttempt(attempt + 1) {[m
+[32m+[m		[32mreturn false[m
+[32m+[m	[32m}[m
+[32m+[m
+[32m+[m	[32mdecision := retry.IsRetryable([m
+[32m+[m		[32mretry.RequestPolicy{[m
+[32m+[m			[32mMethod: req.Method,[m
+[32m+[m		[32m},[m
+[32m+[m		[32mretry.ResponsePolicy{[m
+[32m+[m			[32mStatusCode: http.StatusServiceUnavailable,[m
+[32m+[m		[32m},[m
+[32m+[m	[32m)[m
+[32m+[m
+[32m+[m	[32mreturn decision == retry.Retry[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunc (e *Executor) shouldRetryResponse([m
+[32m+[m	[32mreq *http.Request,[m
+[32m+[m	[32mresult *Result,[m
+[32m+[m	[32mattempt int,[m
+[32m+[m[32m) bool {[m
+[32m+[m
+[32m+[m	[32mif !e.Retry.ShouldAttempt(attempt + 1) {[m
+[32m+[m		[32mreturn false[m
+[32m+[m	[32m}[m
+[32m+[m
+[32m+[m	[32mdecision := retry.IsRetryable([m
+[32m+[m		[32mretry.RequestPolicy{[m
+[32m+[m			[32mMethod: req.Method,[m
+[32m+[m		[32m},[m
+[32m+[m		[32mretry.ResponsePolicy{[m
+[32m+[m			[32mStatusCode: result.StatusCode,[m
+[32m+[m		[32m},[m
+[32m+[m	[32m)[m
+[32m+[m
+[32m+[m	[32mreturn decision == retry.Retry[m
+[32m+[m[32m}[m
+[32m+[m
+ func (e *Executor) executeOnce([m
+ 	ctx context.Context,[m
+ 	req *http.Request,[m
+[32m+[m	[32mbody []byte,[m
+ ) (*Result, error) {[m
+ [m
+ 	upstreamURL := *e.Upstream[m
+[36m@@ -161,7 +214,7 @@[m [mfunc (e *Executor) executeOnce([m
+ 		ctx,[m
+ 		req.Method,[m
+ 		upstreamURL.String(),[m
+[31m-		bytes.NewReader(nil),[m
+[32m+[m		[32mbytes.NewReader(body),[m
+ 	)[m
+ [m
+ 	if err != nil {[m
+[36m@@ -177,7 +230,7 @@[m [mfunc (e *Executor) executeOnce([m
+ [m
+ 	defer resp.Body.Close()[m
+ [m
+[31m-	body, err := io.ReadAll(resp.Body)[m
+[32m+[m	[32mresponseBody, err := io.ReadAll(resp.Body)[m
+ 	if err != nil {[m
+ 		return nil, err[m
+ 	}[m
+[36m@@ -185,7 +238,7 @@[m [mfunc (e *Executor) executeOnce([m
+ 	return &Result{[m
+ 		StatusCode: resp.StatusCode,[m
+ 		Header:     resp.Header.Clone(),[m
+[31m-		Body:       body,[m
+[32m+[m		[32mBody:       responseBody,[m
+ 	}, nil[m
+ }[m
+ [m
+[36m@@ -199,6 +252,10 @@[m [mfunc (r *Result) WriteTo([m
+ 		}[m
+ 	}[m
+ [m
+[32m+[m	[32m// Avoid forwarding an upstream Content-Length that may no longer[m
+[32m+[m	[32m// match the response after gateway processing.[m
+[32m+[m	[32mw.Header().Del("Content-Length")[m
+[32m+[m
+ 	w.WriteHeader(r.StatusCode)[m
+ [m
+ 	_, err := io.Copy([m
