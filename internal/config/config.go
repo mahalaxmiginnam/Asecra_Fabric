@@ -1,71 +1,151 @@
 package config
 
 import (
+	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"time"
 )
 
 type Config struct {
-	GatewayAddr string
-	BackendURL  string
+	Gateway        GatewayConfig
+	Upstream       UpstreamConfig
+	Retry          RetryConfig
+	CircuitBreaker CircuitBreakerConfig
+	Idempotency    IdempotencyConfig
+}
 
+type GatewayConfig struct {
+	Address        string
 	RequestTimeout time.Duration
+}
 
+type UpstreamConfig struct {
+	URL string
+}
+
+type RetryConfig struct {
 	MaxAttempts int
 	BaseDelay   time.Duration
-
-	CircuitFailureThreshold int
-	CircuitResetTimeout     time.Duration
-
-	IdempotencyTTL time.Duration
 }
 
-func Load() Config {
-	return Config{
-		GatewayAddr: getString(
-			"ASECRA_GATEWAY_ADDR",
-			":8080",
-		),
+type CircuitBreakerConfig struct {
+	FailureThreshold int
+	ResetTimeout     time.Duration
+}
 
-		BackendURL: getString(
-			"ASECRA_BACKEND_URL",
-			"http://localhost:9000",
-		),
+type IdempotencyConfig struct {
+	TTL time.Duration
+}
 
-		RequestTimeout: getDuration(
-			"ASECRA_REQUEST_TIMEOUT",
-			2*time.Second,
-		),
+func Load() (Config, error) {
+	cfg := Config{
+		Gateway: GatewayConfig{
+			Address: getEnv(
+				"ASECRA_GATEWAY_ADDR",
+				":8080",
+			),
+			RequestTimeout: getDurationEnv(
+				"ASECRA_REQUEST_TIMEOUT",
+				2*time.Second,
+			),
+		},
 
-		MaxAttempts: getInt(
-			"ASECRA_MAX_ATTEMPTS",
-			3,
-		),
+		Upstream: UpstreamConfig{
+			URL: getEnv(
+				"ASECRA_UPSTREAM_URL",
+				"http://localhost:9000",
+			),
+		},
 
-		BaseDelay: getDuration(
-			"ASECRA_BASE_DELAY",
-			100*time.Millisecond,
-		),
+		Retry: RetryConfig{
+			MaxAttempts: getIntEnv(
+				"ASECRA_RETRY_MAX_ATTEMPTS",
+				3,
+			),
+			BaseDelay: getDurationEnv(
+				"ASECRA_RETRY_BASE_DELAY",
+				100*time.Millisecond,
+			),
+		},
 
-		CircuitFailureThreshold: getInt(
-			"ASECRA_CIRCUIT_FAILURE_THRESHOLD",
-			3,
-		),
+		CircuitBreaker: CircuitBreakerConfig{
+			FailureThreshold: getIntEnv(
+				"ASECRA_CIRCUIT_FAILURE_THRESHOLD",
+				3,
+			),
+			ResetTimeout: getDurationEnv(
+				"ASECRA_CIRCUIT_RESET_TIMEOUT",
+				10*time.Second,
+			),
+		},
 
-		CircuitResetTimeout: getDuration(
-			"ASECRA_CIRCUIT_RESET_TIMEOUT",
-			10*time.Second,
-		),
-
-		IdempotencyTTL: getDuration(
-			"ASECRA_IDEMPOTENCY_TTL",
-			10*time.Minute,
-		),
+		Idempotency: IdempotencyConfig{
+			TTL: getDurationEnv(
+				"ASECRA_IDEMPOTENCY_TTL",
+				10*time.Minute,
+			),
+		},
 	}
+
+	if err := validate(cfg); err != nil {
+		return Config{}, err
+	}
+
+	return cfg, nil
 }
 
-func getString(
+func validate(cfg Config) error {
+	if cfg.Gateway.Address == "" {
+		return fmt.Errorf("gateway address cannot be empty")
+	}
+
+	if cfg.Gateway.RequestTimeout <= 0 {
+		return fmt.Errorf("request timeout must be greater than zero")
+	}
+
+	if _, err := url.ParseRequestURI(cfg.Upstream.URL); err != nil {
+		return fmt.Errorf(
+			"invalid upstream URL: %w",
+			err,
+		)
+	}
+
+	if cfg.Retry.MaxAttempts < 1 {
+		return fmt.Errorf(
+			"retry max attempts must be at least 1",
+		)
+	}
+
+	if cfg.Retry.BaseDelay < 0 {
+		return fmt.Errorf(
+			"retry base delay cannot be negative",
+		)
+	}
+
+	if cfg.CircuitBreaker.FailureThreshold < 1 {
+		return fmt.Errorf(
+			"circuit failure threshold must be at least 1",
+		)
+	}
+
+	if cfg.CircuitBreaker.ResetTimeout <= 0 {
+		return fmt.Errorf(
+			"circuit reset timeout must be greater than zero",
+		)
+	}
+
+	if cfg.Idempotency.TTL <= 0 {
+		return fmt.Errorf(
+			"idempotency TTL must be greater than zero",
+		)
+	}
+
+	return nil
+}
+
+func getEnv(
 	key string,
 	defaultValue string,
 ) string {
@@ -78,7 +158,7 @@ func getString(
 	return value
 }
 
-func getInt(
+func getIntEnv(
 	key string,
 	defaultValue int,
 ) int {
@@ -88,15 +168,15 @@ func getInt(
 		return defaultValue
 	}
 
-	result, err := strconv.Atoi(value)
+	parsed, err := strconv.Atoi(value)
 	if err != nil {
 		return defaultValue
 	}
 
-	return result
+	return parsed
 }
 
-func getDuration(
+func getDurationEnv(
 	key string,
 	defaultValue time.Duration,
 ) time.Duration {
@@ -106,10 +186,10 @@ func getDuration(
 		return defaultValue
 	}
 
-	result, err := time.ParseDuration(value)
+	parsed, err := time.ParseDuration(value)
 	if err != nil {
 		return defaultValue
 	}
 
-	return result
+	return parsed
 }
