@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/circuitbreaker"
+	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/metrics"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/retry"
 )
 
@@ -17,6 +18,7 @@ type Executor struct {
 	Upstream       *url.URL
 	Retry          retry.Controller
 	Breaker        *circuitbreaker.Breaker
+	Metrics        *metrics.Metrics
 	RequestTimeout time.Duration
 }
 
@@ -34,6 +36,10 @@ func (e *Executor) Execute(
 
 	if e.Breaker != nil {
 		if err := e.Breaker.Allow(); err != nil {
+			if e.Metrics != nil {
+				e.Metrics.RecordCircuitBreakerRejection()
+			}
+
 			return nil, err
 		}
 	}
@@ -45,6 +51,7 @@ func (e *Executor) Execute(
 	defer cancel()
 
 	// Read the incoming request body once.
+	// The same byte slice is reused for every retry.
 	var requestBody []byte
 
 	if req.Body != nil {
@@ -75,12 +82,20 @@ func (e *Executor) Execute(
 		if err != nil {
 			lastErr = err
 
+			if e.Metrics != nil {
+				e.Metrics.RecordUpstreamFailure()
+			}
+
 			if !e.shouldRetry(req, attempt) {
 				if e.Breaker != nil {
 					e.Breaker.Failure()
 				}
 
 				return nil, err
+			}
+
+			if e.Metrics != nil {
+				e.Metrics.RecordRetry()
 			}
 
 			if waitErr := e.Retry.Wait(
@@ -115,6 +130,11 @@ func (e *Executor) Execute(
 				result.Attempts = attempt
 
 				return result, nil
+			}
+
+			if e.Metrics != nil {
+				e.Metrics.RecordUpstreamFailure()
+				e.Metrics.RecordRetry()
 			}
 
 			if waitErr := e.Retry.Wait(
@@ -200,6 +220,10 @@ func (e *Executor) executeOnce(
 	req *http.Request,
 	body []byte,
 ) (*Result, error) {
+
+	if e.Metrics != nil {
+		e.Metrics.RecordUpstreamRequest()
+	}
 
 	upstreamURL := *e.Upstream
 

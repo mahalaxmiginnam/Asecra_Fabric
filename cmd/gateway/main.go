@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -14,20 +15,23 @@ import (
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/circuitbreaker"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/config"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/idempotency"
+	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/metrics"
+	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/observability"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/proxy"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/requestid"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/retry"
 )
 
-const (
-	apiPrefix = "/api"
-)
+const apiPrefix = "/api"
 
 func newHandler() (http.Handler, error) {
 	cfg, err := config.Load()
 	if err != nil {
 		return nil, err
 	}
+
+	logger := observability.NewLogger()
+	metricsCollector := metrics.New()
 
 	// ------------------------------------------------------------
 	// Upstream
@@ -65,6 +69,8 @@ func newHandler() (http.Handler, error) {
 
 		Breaker: breaker,
 
+		Metrics: metricsCollector,
+
 		RequestTimeout: cfg.Gateway.RequestTimeout,
 	}
 
@@ -99,6 +105,18 @@ func newHandler() (http.Handler, error) {
 				w.WriteHeader(http.StatusOK)
 
 				_, _ = w.Write([]byte("ok"))
+
+				return
+			}
+
+			// ----------------------------------------------------
+			// Metrics
+			// ----------------------------------------------------
+
+			if r.URL.Path == "/metrics" {
+				metrics.Handler(
+					metricsCollector,
+				).ServeHTTP(w, r)
 
 				return
 			}
@@ -141,6 +159,7 @@ func newHandler() (http.Handler, error) {
 			// Retry
 			// Circuit Breaker
 			// Proxy
+			// Metrics
 			// ----------------------------------------------------
 
 			result, err := executor.Execute(
@@ -148,19 +167,22 @@ func newHandler() (http.Handler, error) {
 				r,
 			)
 
+			if result != nil {
+				r.Header.Set(
+					observability.UpstreamAttemptsHeader,
+					strconv.Itoa(result.Attempts),
+				)
+			}
+
 			// Restore client-facing path.
 			r.URL.Path = originalPath
 
 			if err != nil {
-				log.Printf(
-					"gateway: request failed method=%s path=%s request_id=%s error=%v",
-					r.Method,
-					originalPath,
-					r.Header.Get(requestid.Header),
-					err,
-				)
 
+				// ------------------------------------------------
 				// Circuit breaker rejection.
+				// ------------------------------------------------
+
 				if err == circuitbreaker.ErrOpen ||
 					err == circuitbreaker.ErrBusy {
 
@@ -173,6 +195,10 @@ func newHandler() (http.Handler, error) {
 					return
 				}
 
+				// ------------------------------------------------
+				// Generic upstream failure.
+				// ------------------------------------------------
+
 				http.Error(
 					w,
 					"upstream request failed",
@@ -181,19 +207,6 @@ func newHandler() (http.Handler, error) {
 
 				return
 			}
-
-			// ----------------------------------------------------
-			// Logging
-			// ----------------------------------------------------
-
-			log.Printf(
-				"gateway: method=%s path=%s status=%d attempts=%d request_id=%s",
-				r.Method,
-				originalPath,
-				result.StatusCode,
-				result.Attempts,
-				r.Header.Get(requestid.Header),
-			)
 
 			// ----------------------------------------------------
 			// Write upstream response.
@@ -212,11 +225,30 @@ func newHandler() (http.Handler, error) {
 	// ------------------------------------------------------------
 	// Middleware
 	//
+	// Execution order:
+	//
+	// Request ID
+	//      ↓
+	// Observability
+	//      ↓
+	// Idempotency
+	//      ↓
+	// Gateway Handler
+	//      ↓
+	// Proxy
+	//      ↓
+	// Upstream
+	//
 	// Request ID is outermost so every request receives a
 	// correlation ID, including middleware-generated errors.
 	// ------------------------------------------------------------
 
 	handler = idempotencyMiddleware.Handler(handler)
+
+	handler = observability.Middleware(
+		logger,
+		handler,
+	)
 
 	handler = requestid.Middleware(handler)
 
@@ -252,7 +284,6 @@ func main() {
 	// ------------------------------------------------------------
 
 	go func() {
-
 		log.Printf(
 			"Asecra Fabric gateway listening on %s",
 			cfg.Gateway.Address,
