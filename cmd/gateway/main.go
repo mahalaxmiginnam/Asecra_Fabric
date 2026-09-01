@@ -1,106 +1,241 @@
 package main
 
 import (
-	"context"
-	"fmt"
 	"log"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/circuitbreaker"
+	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/idempotency"
+	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/proxy"
+	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/retry"
 )
 
-const backendTimeout = 2 * time.Second
+const (
+	gatewayAddr = ":8080"
+	backendURL  = "http://localhost:9000"
 
-func healthHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+	requestTimeout = 2 * time.Second
 
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintln(w, "ok")
-}
+	maxAttempts = 3
+	baseDelay   = 100 * time.Millisecond
 
-func withTimeout(timeout time.Duration, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithTimeout(r.Context(), timeout)
-		defer cancel()
+	apiPrefix = "/api"
 
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
-}
+	circuitFailureThreshold = 3
+	circuitResetTimeout     = 10 * time.Second
+
+	idempotencyTTL = 10 * time.Minute
+)
 
 func main() {
-	backendURL, err := url.Parse("http://localhost:9000")
+
+	// ------------------------------------------------------------
+	// Upstream
+	// ------------------------------------------------------------
+
+	upstream, err := url.Parse(backendURL)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	proxy := httputil.NewSingleHostReverseProxy(backendURL)
+	// ------------------------------------------------------------
+	// Circuit Breaker
+	// ------------------------------------------------------------
 
-	originalDirector := proxy.Director
-
-	proxy.Director = func(req *http.Request) {
-		originalDirector(req)
-
-		req.URL.Path = strings.TrimPrefix(req.URL.Path, "/api")
-
-		if req.URL.Path == "" {
-			req.URL.Path = "/"
-		}
-
-		log.Printf(
-			"GATEWAY: forwarding %s %s",
-			req.Method,
-			req.URL.Path,
-		)
-	}
-
-	proxy.ErrorHandler = func(
-		w http.ResponseWriter,
-		r *http.Request,
-		err error,
-	) {
-		log.Printf("GATEWAY: proxy error: %v", err)
-
-		if r.Context().Err() != nil {
-			http.Error(
-				w,
-				"upstream request cancelled",
-				http.StatusGatewayTimeout,
-			)
-			return
-		}
-
-		http.Error(
-			w,
-			"bad gateway",
-			http.StatusBadGateway,
-		)
-	}
-
-	mux := http.NewServeMux()
-
-	mux.HandleFunc("/health", healthHandler)
-
-	mux.Handle(
-		"/api/",
-		withTimeout(backendTimeout, proxy),
+	breaker := circuitbreaker.New(
+		circuitFailureThreshold,
+		circuitResetTimeout,
 	)
 
-	server := &http.Server{
-		Addr:         ":8080",
-		Handler:      mux,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  30 * time.Second,
+	// ------------------------------------------------------------
+	// Proxy Executor
+	// ------------------------------------------------------------
+
+	executor := &proxy.Executor{
+		Client: &http.Client{
+			Timeout: 0,
+		},
+
+		Upstream: upstream,
+
+		Retry: retry.Controller{
+			MaxAttempts: maxAttempts,
+			BaseDelay:   baseDelay,
+		},
+
+		Breaker: breaker,
+
+		RequestTimeout: requestTimeout,
 	}
 
-	log.Println("Asecra Fabric gateway listening on :8080")
+	// ------------------------------------------------------------
+	// Idempotency
+	// ------------------------------------------------------------
 
-	if err := server.ListenAndServe(); err != nil {
+	idempotencyStore := idempotency.NewStore(
+		idempotencyTTL,
+	)
+
+	idempotencyController := idempotency.NewController(
+		idempotencyStore,
+	)
+
+	idempotencyMiddleware := idempotency.NewMiddleware(
+		idempotencyController,
+	)
+
+	// ------------------------------------------------------------
+	// Gateway Handler
+	// ------------------------------------------------------------
+
+	var handler http.Handler = http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+
+			// ----------------------------------------------------
+			// Health
+			// ----------------------------------------------------
+
+			if r.URL.Path == "/health" {
+				w.WriteHeader(http.StatusOK)
+
+				_, _ = w.Write(
+					[]byte("ok"),
+				)
+
+				return
+			}
+
+			// ----------------------------------------------------
+			// API Routing
+			// ----------------------------------------------------
+
+			if !strings.HasPrefix(
+				r.URL.Path,
+				apiPrefix+"/",
+			) {
+				http.NotFound(
+					w,
+					r,
+				)
+
+				return
+			}
+
+			// Preserve client-facing path.
+			originalPath := r.URL.Path
+
+			// ----------------------------------------------------
+			// Strip /api before forwarding.
+			//
+			// /api/hello
+			//      ↓
+			// /hello
+			// ----------------------------------------------------
+
+			r.URL.Path = strings.TrimPrefix(
+				r.URL.Path,
+				apiPrefix,
+			)
+
+			if r.URL.Path == "" {
+				r.URL.Path = "/"
+			}
+
+			// ----------------------------------------------------
+			// Execute through:
+			//
+			// Retry
+			// Circuit Breaker
+			// Upstream Proxy
+			// ----------------------------------------------------
+
+			result, err := executor.Execute(
+				r.Context(),
+				r,
+			)
+
+			// Restore client-facing path.
+			r.URL.Path = originalPath
+
+			if err != nil {
+
+				log.Printf(
+					"gateway: request failed path=%s error=%v",
+					originalPath,
+					err,
+				)
+
+				// Circuit breaker rejection.
+				if err == circuitbreaker.ErrOpen ||
+					err == circuitbreaker.ErrBusy {
+
+					http.Error(
+						w,
+						"upstream temporarily unavailable",
+						http.StatusServiceUnavailable,
+					)
+
+					return
+				}
+
+				http.Error(
+					w,
+					"upstream request failed",
+					http.StatusBadGateway,
+				)
+
+				return
+			}
+
+			// ----------------------------------------------------
+			// Logging
+			// ----------------------------------------------------
+
+			log.Printf(
+				"gateway: path=%s status=%d attempts=%d",
+				originalPath,
+				result.StatusCode,
+				result.Attempts,
+			)
+
+			// ----------------------------------------------------
+			// Write upstream response.
+			// ----------------------------------------------------
+
+			if err := result.WriteTo(w); err != nil {
+
+				log.Printf(
+					"gateway: response write error=%v",
+					err,
+				)
+			}
+		},
+	)
+
+	// ------------------------------------------------------------
+	// Middleware
+	// ------------------------------------------------------------
+
+	handler = idempotencyMiddleware.Handler(
+		handler,
+	)
+
+	// ------------------------------------------------------------
+	// Start Gateway
+	// ------------------------------------------------------------
+
+	log.Printf(
+		"Asecra Fabric gateway listening on %s",
+		gatewayAddr,
+	)
+
+	if err := http.ListenAndServe(
+		gatewayAddr,
+		handler,
+	); err != nil {
 		log.Fatal(err)
 	}
 }
