@@ -17,6 +17,7 @@ import (
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/idempotency"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/metrics"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/observability"
+	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/plugin"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/proxy"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/recovery"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/requestid"
@@ -34,6 +35,16 @@ func newHandler() (http.Handler, error) {
 }
 
 func newHandlerWithConfig(cfg config.Config) (http.Handler, error) {
+	return newHandlerWithConfigAndPipeline(
+		cfg,
+		plugin.NewPipeline(),
+	)
+}
+
+func newHandlerWithConfigAndPipeline(
+	cfg config.Config,
+	pluginPipeline *plugin.Pipeline,
+) (http.Handler, error) {
 	logger := observability.NewLogger()
 	metricsCollector := metrics.New()
 
@@ -88,6 +99,42 @@ func newHandlerWithConfig(cfg config.Config) (http.Handler, error) {
 				w,
 				"route not found",
 				http.StatusNotFound,
+			)
+			return
+		}
+
+		pluginContext := &plugin.Context{
+			Request: r,
+			Route:   route,
+		}
+
+		pipelineResult, err := pluginPipeline.Execute(
+			pluginContext,
+		)
+		if err != nil {
+			http.Error(
+				w,
+				"plugin pipeline failed",
+				http.StatusInternalServerError,
+			)
+			return
+		}
+
+		if pipelineResult.Outcome == plugin.Reject {
+			statusCode := pipelineResult.StatusCode
+			if statusCode == 0 {
+				statusCode = http.StatusForbidden
+			}
+
+			message := pipelineResult.Message
+			if message == "" {
+				message = http.StatusText(statusCode)
+			}
+
+			http.Error(
+				w,
+				message,
+				statusCode,
 			)
 			return
 		}

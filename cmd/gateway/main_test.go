@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/config"
+	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/plugin"
 )
 
 func TestGatewayRoutesToMultipleUpstreams(t *testing.T) {
@@ -358,4 +360,204 @@ func TestGatewayForwardsRequestIDToUpstream(t *testing.T) {
 			requestID,
 		)
 	}
+}
+
+func TestGatewayRejectsRequestFromPolicy(t *testing.T) {
+	upstreamCalled := false
+
+	upstream := httptest.NewServer(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			upstreamCalled = true
+			w.WriteHeader(http.StatusOK)
+		}),
+	)
+	defer upstream.Close()
+
+	cfg := config.Config{
+		Gateway: config.GatewayConfig{
+			Address:        ":0",
+			RequestTimeout: time.Second,
+		},
+		Upstreams: map[string]string{
+			"default": upstream.URL,
+		},
+		Retry: config.RetryConfig{
+			MaxAttempts: 1,
+			BaseDelay:   0,
+		},
+		CircuitBreaker: config.CircuitBreakerConfig{
+			FailureThreshold: 3,
+			ResetTimeout:     time.Second,
+		},
+		Idempotency: config.IdempotencyConfig{
+			TTL: time.Minute,
+		},
+	}
+
+	pipeline := plugin.NewPipeline(
+		plugin.PolicyComponent(
+			plugin.MethodPolicy{
+				AllowedMethods: map[string]bool{
+					http.MethodPost: true,
+				},
+			},
+		),
+	)
+
+	handler, err := newHandlerWithConfigAndPipeline(
+		cfg,
+		pipeline,
+	)
+	if err != nil {
+		t.Fatalf(
+			"newHandlerWithConfigAndPipeline() error = %v",
+			err,
+		)
+	}
+
+	req := httptest.NewRequest(
+		http.MethodGet,
+		"http://gateway.local/api/test",
+		nil,
+	)
+
+	recorder := httptest.NewRecorder()
+
+	handler.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusMethodNotAllowed {
+		t.Fatalf(
+			"status = %d, want %d",
+			recorder.Code,
+			http.StatusMethodNotAllowed,
+		)
+	}
+
+	if got := recorder.Body.String(); got != "method not allowed\n" {
+		t.Fatalf(
+			"body = %q, want %q",
+			got,
+			"method not allowed\n",
+		)
+	}
+
+	if upstreamCalled {
+		t.Fatal("upstream was called after policy rejection")
+	}
+}
+
+func TestGatewayExecutesPluginBeforeUpstream(t *testing.T) {
+	var pluginRoute string
+	var pluginMethod string
+
+	upstream := httptest.NewServer(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("upstream-ok"))
+		}),
+	)
+	defer upstream.Close()
+
+	cfg := config.Config{
+		Gateway: config.GatewayConfig{
+			Address:        ":0",
+			RequestTimeout: time.Second,
+		},
+		Upstreams: map[string]string{
+			"default": upstream.URL,
+		},
+		Retry: config.RetryConfig{
+			MaxAttempts: 1,
+			BaseDelay:   0,
+		},
+		CircuitBreaker: config.CircuitBreakerConfig{
+			FailureThreshold: 3,
+			ResetTimeout:     time.Second,
+		},
+		Idempotency: config.IdempotencyConfig{
+			TTL: time.Minute,
+		},
+	}
+
+	pipeline := plugin.NewPipeline(
+		plugin.PluginComponent(
+			testGatewayRecordingPlugin{
+				onExecute: func(ctx *plugin.Context) {
+					pluginRoute = ctx.Route.Name
+					pluginMethod = ctx.Request.Method
+				},
+			},
+		),
+	)
+
+	handler, err := newHandlerWithConfigAndPipeline(
+		cfg,
+		pipeline,
+	)
+	if err != nil {
+		t.Fatalf(
+			"newHandlerWithConfigAndPipeline() error = %v",
+			err,
+		)
+	}
+
+	req := httptest.NewRequest(
+		http.MethodGet,
+		"http://gateway.local/api/test",
+		nil,
+	)
+
+	recorder := httptest.NewRecorder()
+
+	handler.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf(
+			"status = %d, want %d",
+			recorder.Code,
+			http.StatusOK,
+		)
+	}
+
+	if got := recorder.Body.String(); got != "upstream-ok" {
+		t.Fatalf(
+			"body = %q, want %q",
+			got,
+			"upstream-ok",
+		)
+	}
+
+	if pluginRoute != "api" {
+		t.Fatalf(
+			"plugin route = %q, want %q",
+			pluginRoute,
+			"api",
+		)
+	}
+
+	if pluginMethod != http.MethodGet {
+		t.Fatalf(
+			"plugin method = %q, want %q",
+			pluginMethod,
+			http.MethodGet,
+		)
+	}
+}
+
+type testGatewayRecordingPlugin struct {
+	onExecute func(*plugin.Context)
+}
+
+func (p testGatewayRecordingPlugin) Name() string {
+	return "gateway-recording-plugin"
+}
+
+func (p testGatewayRecordingPlugin) Execute(
+	ctx *plugin.Context,
+) (plugin.Result, error) {
+	p.onExecute(ctx)
+
+	return plugin.Result{
+		Outcome: plugin.Continue,
+	}, nil
 }
