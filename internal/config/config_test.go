@@ -27,10 +27,10 @@ func TestLoadDefaults(t *testing.T) {
 		)
 	}
 
-	if cfg.Upstream.URL != "http://localhost:9000" {
+	if cfg.Upstreams["default"] != "http://localhost:9000" {
 		t.Fatalf(
 			"unexpected upstream URL: %s",
-			cfg.Upstream.URL,
+			cfg.Upstreams["default"],
 		)
 	}
 
@@ -87,10 +87,10 @@ func TestLoadEnvironmentOverrides(t *testing.T) {
 		)
 	}
 
-	if cfg.Upstream.URL != "http://localhost:9999" {
+	if cfg.Upstreams["default"] != "http://localhost:9999" {
 		t.Fatalf(
 			"unexpected upstream URL: %s",
-			cfg.Upstream.URL,
+			cfg.Upstreams["default"],
 		)
 	}
 

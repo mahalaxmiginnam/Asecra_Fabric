@@ -20,9 +20,8 @@ import (
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/proxy"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/requestid"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/retry"
+	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/router"
 )
-
-const apiPrefix = "/api"
 
 func newHandler() (http.Handler, error) {
 	cfg, err := config.Load()
@@ -30,53 +29,30 @@ func newHandler() (http.Handler, error) {
 		return nil, err
 	}
 
+	return newHandlerWithConfig(cfg)
+}
+
+func newHandlerWithConfig(cfg config.Config) (http.Handler, error) {
 	logger := observability.NewLogger()
 	metricsCollector := metrics.New()
 
-	// ------------------------------------------------------------
-	// Upstream
-	// ------------------------------------------------------------
-
-	upstream, err := url.Parse(cfg.Upstream.URL)
-	if err != nil {
-		return nil, err
-	}
-
-	// ------------------------------------------------------------
-	// Circuit Breaker
-	// ------------------------------------------------------------
+	requestRouter := router.NewRouter([]router.Route{
+		{
+			Name:     "orders",
+			Prefix:   "/api/orders",
+			Upstream: "orders",
+		},
+		{
+			Name:     "api",
+			Prefix:   "/api",
+			Upstream: "default",
+		},
+	})
 
 	breaker := circuitbreaker.New(
 		cfg.CircuitBreaker.FailureThreshold,
 		cfg.CircuitBreaker.ResetTimeout,
 	)
-
-	// ------------------------------------------------------------
-	// Proxy Executor
-	// ------------------------------------------------------------
-
-	executor := &proxy.Executor{
-		Client: &http.Client{
-			Timeout: 0,
-		},
-
-		Upstream: upstream,
-
-		Retry: retry.Controller{
-			MaxAttempts: cfg.Retry.MaxAttempts,
-			BaseDelay:   cfg.Retry.BaseDelay,
-		},
-
-		Breaker: breaker,
-
-		Metrics: metricsCollector,
-
-		RequestTimeout: cfg.Gateway.RequestTimeout,
-	}
-
-	// ------------------------------------------------------------
-	// Idempotency
-	// ------------------------------------------------------------
 
 	idempotencyStore := idempotency.NewStore(
 		cfg.Idempotency.TTL,
@@ -90,166 +66,120 @@ func newHandler() (http.Handler, error) {
 		idempotencyController,
 	)
 
-	// ------------------------------------------------------------
-	// Gateway Handler
-	// ------------------------------------------------------------
+	var handler http.Handler = http.HandlerFunc(func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+			return
+		}
 
-	var handler http.Handler = http.HandlerFunc(
-		func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/metrics" {
+			metrics.Handler(metricsCollector).ServeHTTP(w, r)
+			return
+		}
 
-			// ----------------------------------------------------
-			// Health
-			// ----------------------------------------------------
-
-			if r.URL.Path == "/health" {
-				w.WriteHeader(http.StatusOK)
-
-				_, _ = w.Write([]byte("ok"))
-
-				return
-			}
-
-			// ----------------------------------------------------
-			// Metrics
-			// ----------------------------------------------------
-
-			if r.URL.Path == "/metrics" {
-				metrics.Handler(
-					metricsCollector,
-				).ServeHTTP(w, r)
-
-				return
-			}
-
-			// ----------------------------------------------------
-			// API Routing
-			// ----------------------------------------------------
-
-			if !strings.HasPrefix(
-				r.URL.Path,
-				apiPrefix+"/",
-			) {
-				http.NotFound(w, r)
-
-				return
-			}
-
-			originalPath := r.URL.Path
-
-			// ----------------------------------------------------
-			// Strip /api before forwarding.
-			//
-			// /api/orders
-			//       ↓
-			// /orders
-			// ----------------------------------------------------
-
-			r.URL.Path = strings.TrimPrefix(
-				r.URL.Path,
-				apiPrefix,
+		route, matched := requestRouter.Match(r.URL.Path)
+		if !matched {
+			http.Error(
+				w,
+				"route not found",
+				http.StatusNotFound,
 			)
+			return
+		}
 
-			if r.URL.Path == "" {
-				r.URL.Path = "/"
-			}
-
-			// ----------------------------------------------------
-			// Execute through:
-			//
-			// Retry
-			// Circuit Breaker
-			// Proxy
-			// Metrics
-			// ----------------------------------------------------
-
-			result, err := executor.Execute(
-				r.Context(),
-				r,
+		upstreamURL, ok := cfg.Upstreams[route.Upstream]
+		if !ok {
+			http.Error(
+				w,
+				"upstream configuration not found",
+				http.StatusBadGateway,
 			)
+			return
+		}
 
-			if result != nil {
-				r.Header.Set(
-					observability.UpstreamAttemptsHeader,
-					strconv.Itoa(result.Attempts),
-				)
-			}
+		upstream, err := url.Parse(upstreamURL)
+		if err != nil {
+			http.Error(
+				w,
+				"invalid upstream configuration",
+				http.StatusBadGateway,
+			)
+			return
+		}
 
-			// Restore client-facing path.
-			r.URL.Path = originalPath
+		executor := &proxy.Executor{
+			Client: &http.Client{
+				Timeout: 0,
+			},
+			Upstream: upstream,
+			Retry: retry.Controller{
+				MaxAttempts: cfg.Retry.MaxAttempts,
+				BaseDelay:   cfg.Retry.BaseDelay,
+			},
+			Breaker:        breaker,
+			Metrics:        metricsCollector,
+			RequestTimeout: cfg.Gateway.RequestTimeout,
+		}
 
-			if err != nil {
+		originalPath := r.URL.Path
 
-				// ------------------------------------------------
-				// Circuit breaker rejection.
-				// ------------------------------------------------
+		r.URL.Path = strings.TrimPrefix(
+			r.URL.Path,
+			route.Prefix,
+		)
 
-				if err == circuitbreaker.ErrOpen ||
-					err == circuitbreaker.ErrBusy {
+		if r.URL.Path == "" {
+			r.URL.Path = "/"
+		}
 
-					http.Error(
-						w,
-						"upstream temporarily unavailable",
-						http.StatusServiceUnavailable,
-					)
+		result, err := executor.Execute(
+			r.Context(),
+			r,
+		)
 
-					return
-				}
+		r.URL.Path = originalPath
 
-				// ------------------------------------------------
-				// Generic upstream failure.
-				// ------------------------------------------------
+		if result != nil {
+			r.Header.Set(
+				observability.UpstreamAttemptsHeader,
+				strconv.Itoa(result.Attempts),
+			)
+		}
 
+		if err != nil {
+			if err == circuitbreaker.ErrOpen {
 				http.Error(
 					w,
-					"upstream request failed",
-					http.StatusBadGateway,
+					"upstream temporarily unavailable",
+					http.StatusServiceUnavailable,
 				)
-
 				return
 			}
 
-			// ----------------------------------------------------
-			// Write upstream response.
-			// ----------------------------------------------------
+			http.Error(
+				w,
+				"upstream request failed",
+				http.StatusBadGateway,
+			)
+			return
+		}
 
-			if err := result.WriteTo(w); err != nil {
-				log.Printf(
-					"gateway: response write error request_id=%s error=%v",
-					r.Header.Get(requestid.Header),
-					err,
-				)
-			}
-		},
-	)
-
-	// ------------------------------------------------------------
-	// Middleware
-	//
-	// Execution order:
-	//
-	// Request ID
-	//      ↓
-	// Observability
-	//      ↓
-	// Idempotency
-	//      ↓
-	// Gateway Handler
-	//      ↓
-	// Proxy
-	//      ↓
-	// Upstream
-	//
-	// Request ID is outermost so every request receives a
-	// correlation ID, including middleware-generated errors.
-	// ------------------------------------------------------------
+		result.WriteTo(w)
+	})
 
 	handler = idempotencyMiddleware.Handler(handler)
-
+	handler = metrics.Middleware(
+		metricsCollector,
+		handler,
+	)
 	handler = observability.Middleware(
 		logger,
 		handler,
 	)
-
 	handler = requestid.Middleware(handler)
 
 	return handler, nil
@@ -258,82 +188,75 @@ func newHandler() (http.Handler, error) {
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf(
+			"failed to load config: %v",
+			err,
+		)
 	}
 
-	handler, err := newHandler()
+	handler, err := newHandlerWithConfig(cfg)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf(
+			"failed to create gateway handler: %v",
+			err,
+		)
 	}
-
-	// ------------------------------------------------------------
-	// HTTP Server
-	// ------------------------------------------------------------
 
 	server := &http.Server{
-		Addr:    cfg.Gateway.Address,
-		Handler: handler,
-
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  30 * time.Second,
+		Addr:              cfg.Gateway.Address,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
-	// ------------------------------------------------------------
-	// Start Server
-	// ------------------------------------------------------------
+	serverErrors := make(chan error, 1)
 
 	go func() {
 		log.Printf(
-			"Asecra Fabric gateway listening on %s",
+			"gateway listening on %s",
 			cfg.Gateway.Address,
 		)
 
 		if err := server.ListenAndServe(); err != nil &&
 			err != http.ErrServerClosed {
-
-			log.Fatalf(
-				"gateway server failed: %v",
-				err,
-			)
+			serverErrors <- err
 		}
 	}()
 
-	// ------------------------------------------------------------
-	// Graceful Shutdown
-	// ------------------------------------------------------------
-
-	stop := make(chan os.Signal, 1)
-
+	shutdownSignal := make(chan os.Signal, 1)
 	signal.Notify(
-		stop,
-		syscall.SIGINT,
+		shutdownSignal,
+		os.Interrupt,
 		syscall.SIGTERM,
 	)
+	defer signal.Stop(shutdownSignal)
 
-	<-stop
+	select {
+	case err := <-serverErrors:
+		log.Fatalf(
+			"gateway server failed: %v",
+			err,
+		)
 
-	log.Println(
-		"gateway shutdown initiated",
-	)
+	case <-shutdownSignal:
+		log.Println("shutdown signal received")
+	}
 
-	// Give active requests time to finish.
-	ctx, cancel := context.WithTimeout(
+	shutdownCtx, cancel := context.WithTimeout(
 		context.Background(),
 		10*time.Second,
 	)
 	defer cancel()
 
-	if err := server.Shutdown(ctx); err != nil {
+	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Printf(
-			"gateway graceful shutdown failed: %v",
+			"gateway shutdown failed: %v",
 			err,
 		)
-
 		return
 	}
 
-	log.Println(
-		"gateway shutdown complete",
-	)
+	log.Println("gateway stopped")
 }

@@ -10,7 +10,7 @@ import (
 
 type Config struct {
 	Gateway        GatewayConfig
-	Upstream       UpstreamConfig
+	Upstreams      map[string]string
 	Retry          RetryConfig
 	CircuitBreaker CircuitBreakerConfig
 	Idempotency    IdempotencyConfig
@@ -19,10 +19,6 @@ type Config struct {
 type GatewayConfig struct {
 	Address        string
 	RequestTimeout time.Duration
-}
-
-type UpstreamConfig struct {
-	URL string
 }
 
 type RetryConfig struct {
@@ -52,8 +48,8 @@ func Load() (Config, error) {
 			),
 		},
 
-		Upstream: UpstreamConfig{
-			URL: getEnv(
+		Upstreams: map[string]string{
+			"default": getEnv(
 				"ASECRA_UPSTREAM_URL",
 				"http://localhost:9000",
 			),
@@ -102,14 +98,19 @@ func validate(cfg Config) error {
 	}
 
 	if cfg.Gateway.RequestTimeout <= 0 {
-		return fmt.Errorf("request timeout must be greater than zero")
+		return fmt.Errorf(
+			"request timeout must be greater than zero",
+		)
 	}
 
-	if _, err := url.ParseRequestURI(cfg.Upstream.URL); err != nil {
-		return fmt.Errorf(
-			"invalid upstream URL: %w",
-			err,
-		)
+	for name, upstreamURL := range cfg.Upstreams {
+		if _, err := url.ParseRequestURI(upstreamURL); err != nil {
+			return fmt.Errorf(
+				"invalid upstream URL for %q: %w",
+				name,
+				err,
+			)
+		}
 	}
 
 	if cfg.Retry.MaxAttempts < 1 {
