@@ -18,6 +18,7 @@ import (
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/metrics"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/observability"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/proxy"
+	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/recovery"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/requestid"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/retry"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/router"
@@ -181,6 +182,7 @@ func newHandlerWithConfig(cfg config.Config) (http.Handler, error) {
 		handler,
 	)
 	handler = requestid.Middleware(handler)
+	handler = recovery.Middleware(handler)
 
 	return handler, nil
 }

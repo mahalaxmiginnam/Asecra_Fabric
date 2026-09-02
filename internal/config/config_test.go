@@ -128,3 +128,111 @@ func TestLoadRejectsInvalidConfiguration(t *testing.T) {
 		t.Fatal("expected configuration validation error")
 	}
 }
+
+func TestLoadRejectsInvalidIntegerEnvironment(t *testing.T) {
+	t.Setenv(
+		"ASECRA_RETRY_MAX_ATTEMPTS",
+		"not-a-number",
+	)
+
+	_, err := Load()
+
+	if err == nil {
+		t.Fatal("expected configuration error")
+	}
+}
+
+func TestLoadRejectsInvalidDurationEnvironment(t *testing.T) {
+	t.Setenv(
+		"ASECRA_REQUEST_TIMEOUT",
+		"not-a-duration",
+	)
+
+	_, err := Load()
+
+	if err == nil {
+		t.Fatal("expected configuration error")
+	}
+}
+
+func TestValidateRejectsEmptyUpstreams(t *testing.T) {
+	cfg := Config{
+		Gateway: GatewayConfig{
+			Address:        ":8080",
+			RequestTimeout: time.Second,
+		},
+		Upstreams: map[string]string{},
+		Retry: RetryConfig{
+			MaxAttempts: 1,
+		},
+		CircuitBreaker: CircuitBreakerConfig{
+			FailureThreshold: 1,
+			ResetTimeout:     time.Second,
+		},
+		Idempotency: IdempotencyConfig{
+			TTL: time.Minute,
+		},
+	}
+
+	err := validate(cfg)
+
+	if err == nil {
+		t.Fatal("expected configuration validation error")
+	}
+}
+
+func TestValidateRejectsNonHTTPUpstream(t *testing.T) {
+	cfg := Config{
+		Gateway: GatewayConfig{
+			Address:        ":8080",
+			RequestTimeout: time.Second,
+		},
+		Upstreams: map[string]string{
+			"default": "ftp://localhost:9000",
+		},
+		Retry: RetryConfig{
+			MaxAttempts: 1,
+		},
+		CircuitBreaker: CircuitBreakerConfig{
+			FailureThreshold: 1,
+			ResetTimeout:     time.Second,
+		},
+		Idempotency: IdempotencyConfig{
+			TTL: time.Minute,
+		},
+	}
+
+	err := validate(cfg)
+
+	if err == nil {
+		t.Fatal("expected configuration validation error")
+	}
+}
+
+func TestValidateRejectsUpstreamWithoutHost(t *testing.T) {
+	cfg := Config{
+		Gateway: GatewayConfig{
+			Address:        ":8080",
+			RequestTimeout: time.Second,
+		},
+		Upstreams: map[string]string{
+			"default": "http://",
+		},
+		Retry: RetryConfig{
+			MaxAttempts: 1,
+		},
+		CircuitBreaker: CircuitBreakerConfig{
+			FailureThreshold: 1,
+			ResetTimeout:     time.Second,
+		},
+		Idempotency: IdempotencyConfig{
+			TTL: time.Minute,
+		},
+	}
+
+	err := validate(cfg)
+
+	if err == nil {
+		t.Fatal("expected configuration validation error")
+	}
+}

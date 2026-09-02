@@ -246,6 +246,7 @@ func (e *Executor) executeOnce(
 	}
 
 	upstreamReq.Header = req.Header.Clone()
+	removeHopByHopHeaders(upstreamReq.Header)
 
 	resp, err := e.Client.Do(upstreamReq)
 	if err != nil {
@@ -316,4 +317,15 @@ func joinPath(
 	}
 
 	return base + path
+}
+
+func removeHopByHopHeaders(header http.Header) {
+	header.Del("Connection")
+	header.Del("Keep-Alive")
+	header.Del("Proxy-Authenticate")
+	header.Del("Proxy-Authorization")
+	header.Del("TE")
+	header.Del("Trailer")
+	header.Del("Transfer-Encoding")
+	header.Del("Upgrade")
 }

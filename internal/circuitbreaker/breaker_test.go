@@ -1,6 +1,7 @@
 package circuitbreaker
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -151,4 +152,32 @@ func TestFailedProbeReopensBreaker(t *testing.T) {
 			b.State(),
 		)
 	}
+}
+func TestBreakerConcurrentAccess(t *testing.T) {
+	breaker := New(3, time.Second)
+
+	const goroutines = 20
+	const iterations = 100
+
+	var wg sync.WaitGroup
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			for j := 0; j < iterations; j++ {
+				if err := breaker.Allow(); err == nil {
+					if j%2 == 0 {
+						breaker.Success()
+					} else {
+						breaker.Failure()
+					}
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
 }
