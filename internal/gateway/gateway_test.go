@@ -537,3 +537,75 @@ func TestGatewayConcurrentUpstreamIsolation(t *testing.T) {
 		}
 	}
 }
+func TestGatewayRestoresRequestPathAfterExecution(t *testing.T) {
+	var receivedPath string
+
+	backend := httptest.NewServer(
+		http.HandlerFunc(func(
+			w http.ResponseWriter,
+			r *http.Request,
+		) {
+			receivedPath = r.URL.Path
+			w.WriteHeader(http.StatusOK)
+		}),
+	)
+	defer backend.Close()
+
+	cfg := config.Config{
+		Gateway: config.GatewayConfig{
+			RequestTimeout: 2 * time.Second,
+		},
+		Upstreams: map[string]string{
+			"default": backend.URL,
+		},
+		Retry: config.RetryConfig{
+			MaxAttempts: 1,
+		},
+		CircuitBreaker: config.CircuitBreakerConfig{
+			FailureThreshold: 3,
+			ResetTimeout:     10 * time.Second,
+		},
+	}
+
+	gatewayRuntime := newTestGateway(
+		t,
+		cfg,
+		plugin.NewPipeline(),
+	)
+
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"http://gateway.test/api/customers/42",
+		nil,
+	)
+
+	originalPath := request.URL.Path
+
+	response := httptest.NewRecorder()
+
+	gatewayRuntime.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf(
+			"expected status %d, got %d",
+			http.StatusOK,
+			response.Code,
+		)
+	}
+
+	if receivedPath != "/customers/42" {
+		t.Fatalf(
+			"upstream received path %q, want %q",
+			receivedPath,
+			"/customers/42",
+		)
+	}
+
+	if request.URL.Path != originalPath {
+		t.Fatalf(
+			"request path = %q, want original path %q",
+			request.URL.Path,
+			originalPath,
+		)
+	}
+}

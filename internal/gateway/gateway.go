@@ -133,6 +133,9 @@ func (g *Gateway) ServeHTTP(
 	}
 
 	originalPath := r.URL.Path
+	defer func() {
+		r.URL.Path = originalPath
+	}()
 
 	r.URL.Path = strings.TrimPrefix(
 		r.URL.Path,
@@ -147,8 +150,6 @@ func (g *Gateway) ServeHTTP(
 		r.Context(),
 		r,
 	)
-
-	r.URL.Path = originalPath
 
 	if result != nil {
 		r.Header.Set(
