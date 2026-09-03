@@ -2,7 +2,6 @@ package gateway
 
 import (
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 
@@ -11,16 +10,14 @@ import (
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/metrics"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/observability"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/plugin"
-	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/proxy"
-	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/retry"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/router"
 )
 
 type Gateway struct {
-	Config   config.Config
-	Router   *router.Router
-	Pipeline *plugin.Pipeline
-	Executor *proxy.Executor
+	Config    config.Config
+	Router    *router.Router
+	Pipeline  *plugin.Pipeline
+	Upstreams map[string]*UpstreamRuntime
 }
 
 func New(
@@ -28,25 +25,29 @@ func New(
 	requestRouter *router.Router,
 	pluginPipeline *plugin.Pipeline,
 	metricsCollector *metrics.Metrics,
-	breaker *circuitbreaker.Breaker,
-) *Gateway {
-	return &Gateway{
-		Config:   cfg,
-		Router:   requestRouter,
-		Pipeline: pluginPipeline,
-		Executor: &proxy.Executor{
-			Client: &http.Client{
-				Timeout: 0,
-			},
-			Retry: retry.Controller{
-				MaxAttempts: cfg.Retry.MaxAttempts,
-				BaseDelay:   cfg.Retry.BaseDelay,
-			},
-			Breaker:        breaker,
-			Metrics:        metricsCollector,
-			RequestTimeout: cfg.Gateway.RequestTimeout,
-		},
+) (*Gateway, error) {
+	upstreams := make(map[string]*UpstreamRuntime)
+
+	for name, rawURL := range cfg.Upstreams {
+		runtime, err := NewUpstreamRuntime(
+			name,
+			rawURL,
+			cfg,
+			metricsCollector,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		upstreams[name] = runtime
 	}
+
+	return &Gateway{
+		Config:    cfg,
+		Router:    requestRouter,
+		Pipeline:  pluginPipeline,
+		Upstreams: upstreams,
+	}, nil
 }
 
 func (g *Gateway) ServeHTTP(
@@ -60,8 +61,12 @@ func (g *Gateway) ServeHTTP(
 	}
 
 	if r.URL.Path == "/metrics" {
-		if g.Executor.Metrics != nil {
-			metrics.Handler(g.Executor.Metrics).ServeHTTP(w, r)
+		upstream := g.Upstreams["metrics"]
+
+		if upstream != nil && upstream.Executor.Metrics != nil {
+			metrics.Handler(
+				upstream.Executor.Metrics,
+			).ServeHTTP(w, r)
 			return
 		}
 
@@ -117,21 +122,11 @@ func (g *Gateway) ServeHTTP(
 		return
 	}
 
-	upstreamURL, ok := g.Config.Upstreams[route.Upstream]
+	upstream, ok := g.Upstreams[route.Upstream]
 	if !ok {
 		http.Error(
 			w,
 			"upstream configuration not found",
-			http.StatusBadGateway,
-		)
-		return
-	}
-
-	upstream, err := url.Parse(upstreamURL)
-	if err != nil {
-		http.Error(
-			w,
-			"invalid upstream configuration",
 			http.StatusBadGateway,
 		)
 		return
@@ -148,9 +143,7 @@ func (g *Gateway) ServeHTTP(
 		r.URL.Path = "/"
 	}
 
-	g.Executor.Upstream = upstream
-
-	result, err := g.Executor.Execute(
+	result, err := upstream.Executor.Execute(
 		r.Context(),
 		r,
 	)

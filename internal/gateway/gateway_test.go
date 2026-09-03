@@ -5,10 +5,10 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/circuitbreaker"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/config"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/metrics"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/plugin"
@@ -54,20 +54,17 @@ func newTestGateway(
 
 	metricsCollector := metrics.New()
 
-	breaker := circuitbreaker.New(
-		cfg.CircuitBreaker.FailureThreshold,
-		cfg.CircuitBreaker.ResetTimeout,
+	gatewayRuntime, err := New(
+		cfg,
+		requestRouter,
+		pipeline,
+		metricsCollector,
 	)
+	if err != nil {
+		t.Fatalf("failed to create gateway: %v", err)
+	}
 
-	
-
-	return New(
-	cfg,
-	requestRouter,
-	pipeline,
-	metricsCollector,
-	breaker,
-	)
+	return gatewayRuntime
 }
 
 func TestGatewayRoutesOrdersToOrdersUpstream(t *testing.T) {
@@ -422,5 +419,121 @@ func TestGatewayAcceptsUpstreamWithBasePath(t *testing.T) {
 			"/v1/customers",
 			receivedPath,
 		)
+	}
+}
+
+func TestGatewayConcurrentUpstreamIsolation(t *testing.T) {
+	ordersRequests := make(chan string, 100)
+	defaultRequests := make(chan string, 100)
+
+	ordersServer := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		ordersRequests <- r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ordersServer.Close()
+
+	defaultServer := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		defaultRequests <- r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer defaultServer.Close()
+
+	cfg := config.Config{
+		Gateway: config.GatewayConfig{
+			RequestTimeout: 2 * time.Second,
+		},
+		Upstreams: map[string]string{
+			"orders":  ordersServer.URL,
+			"default": defaultServer.URL,
+		},
+		Retry: config.RetryConfig{
+			MaxAttempts: 1,
+		},
+		CircuitBreaker: config.CircuitBreakerConfig{
+			FailureThreshold: 3,
+			ResetTimeout:     10 * time.Second,
+		},
+	}
+
+	gatewayRuntime := newTestGateway(
+		t,
+		cfg,
+		plugin.NewPipeline(),
+	)
+
+	const requestsPerRoute = 50
+
+	var wg sync.WaitGroup
+	wg.Add(requestsPerRoute * 2)
+
+	for i := 0; i < requestsPerRoute; i++ {
+		go func() {
+			defer wg.Done()
+
+			request := httptest.NewRequest(
+				http.MethodGet,
+				"http://gateway.test/api/orders/123",
+				nil,
+			)
+			response := httptest.NewRecorder()
+
+			gatewayRuntime.ServeHTTP(response, request)
+
+			if response.Code != http.StatusOK {
+				t.Errorf(
+					"orders request returned status %d",
+					response.Code,
+				)
+			}
+		}()
+
+		go func() {
+			defer wg.Done()
+
+			request := httptest.NewRequest(
+				http.MethodGet,
+				"http://gateway.test/api/customers/42",
+				nil,
+			)
+			response := httptest.NewRecorder()
+
+			gatewayRuntime.ServeHTTP(response, request)
+
+			if response.Code != http.StatusOK {
+				t.Errorf(
+					"default request returned status %d",
+					response.Code,
+				)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	close(ordersRequests)
+	close(defaultRequests)
+
+	for path := range ordersRequests {
+		if path != "/123" {
+			t.Errorf(
+				"orders upstream received unexpected path %q",
+				path,
+			)
+		}
+	}
+
+	for path := range defaultRequests {
+		if path != "/customers/42" {
+			t.Errorf(
+				"default upstream received unexpected path %q",
+				path,
+			)
+		}
 	}
 }

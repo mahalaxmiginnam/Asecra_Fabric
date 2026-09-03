@@ -9,17 +9,14 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/circuitbreaker"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/config"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/gateway"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/idempotency"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/metrics"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/observability"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/plugin"
-	//"github.com/mahalaxmiginnam/Asecra_Fabric/internal/proxy"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/recovery"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/requestid"
-	//"github.com/mahalaxmiginnam/Asecra_Fabric/internal/retry"
 	"github.com/mahalaxmiginnam/Asecra_Fabric/internal/router"
 )
 
@@ -50,18 +47,15 @@ func newHandlerWithConfigAndPipeline(
 		},
 	})
 
-	breaker := circuitbreaker.New(
-		cfg.CircuitBreaker.FailureThreshold,
-		cfg.CircuitBreaker.ResetTimeout,
-	)
-
-	gatewayRuntime := gateway.New(
+	gatewayRuntime, err := gateway.New(
 		cfg,
 		requestRouter,
 		pluginPipeline,
 		metricsCollector,
-		breaker,
 	)
+	if err != nil {
+		return nil, err
+	}
 
 	idempotencyStore := idempotency.NewStore(
 		cfg.Idempotency.TTL,
